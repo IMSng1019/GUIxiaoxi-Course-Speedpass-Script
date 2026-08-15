@@ -1,14 +1,18 @@
 // ==UserScript==
 // @name         贵小溪学习平台 自动刷课助手
 // @namespace    gxx-autowatch
-// @version      1.3.0
-// @description  自动挂机刷完课程视频(默认1x)，看完自动刷新进入下一课，支持折叠章节自动展开/折叠
+// @version      2.0.0
+// @description  自动挂机刷完课程视频并自动切换章节(按学习进度判定)，支持在线测试接入 DeepSeek API 自动答题交卷
 // @author       autogen
 // @match        https://gxx-edu.digitlanguage.com/*
 // @match        http://gxx-edu.digitlanguage.com/*
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
+// 提示：如果答题时日志提示「网络请求被拦截(CORS/CSP)」，请把上面两行 @grant/@run-at 之间的
+//       @grant none 替换成下面两行（去掉行首注释），保存后刷新页面即可绕过跨域限制：
+// @grant        GM_xmlhttpRequest
+// @connect      api.deepseek.com
 
 (function () {
   'use strict';
@@ -16,7 +20,15 @@
   window.__gxxAutoWatchLoaded = true;
 
   var LS_KEY = 'gxx_autowatch_v1';
-  var DEFAULTS = { mode: 'idle', speed: 1, mute: true, autoNext: true };
+  var DEFAULTS = {
+    mode: 'idle', speed: 1, mute: true, autoNext: true,
+    chapterNav: true,          // 章节切换：看完一章后返回课程列表按学习进度进下一章
+    autoQuiz: false,           // 在线测试自动答题
+    autoSubmit: true,          // 全部答完后自动交卷
+    apiKey: '',                // DeepSeek API Key（仅存本机 localStorage）
+    apiBase: 'https://api.deepseek.com/v1',
+    apiModel: 'deepseek-chat'
+  };
   var MODE_LABEL = { turbo: '⚡加速', seek: '⏭跳结尾', idle: '🐢挂机1x' };
   var cfg = Object.assign({}, DEFAULTS);
   try {
@@ -31,6 +43,14 @@
     var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
     function p(n) { return (n < 10 ? '0' : '') + n; }
     return (h ? h + ':' : '') + p(m) + ':' + p(ss);
+  }
+  function docCompare(a, b) {
+    if (a === b) return 0;
+    try {
+      if (a.compareDocumentPosition(b) & 4) return -1;
+      if (b.compareDocumentPosition(a) & 4) return 1;
+      return 0;
+    } catch (e) { return 0; }
   }
 
   /* ---------------- 日志 ---------------- */
@@ -141,7 +161,7 @@
     }
   }, true);
 
-  /* ---------------- 下一课 ---------------- */
+  /* ---------------- 通用 DOM 工具 ---------------- */
   var NEXT_TEXTS = ['下一讲', '下一课', '下一节', '下一章', '下一个', '继续学习', '继续观看'];
   function isVisible(el) {
     if (!el || !el.getClientRects || !el.getClientRects().length) return false;
@@ -151,6 +171,33 @@
   function isDisabled(el) {
     if (el.disabled) return true;
     try { return /disable|disabled/.test(el.className || ''); } catch (e) { return false; }
+  }
+  function clickEl(el) {
+    try {
+      el.scrollIntoView({ block: 'center' });
+      el.click();
+      return true;
+    } catch (e) {
+      try {
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        return true;
+      } catch (e2) { return false; }
+    }
+  }
+  function clickableScore(el) {
+    var s = 0;
+    if (el.tagName === 'A' || el.tagName === 'BUTTON') s += 3;
+    try {
+      if (el.getAttribute && el.getAttribute('onclick')) s += 3;
+      if (el.getAttribute && (el.getAttribute('role') === 'button' || el.getAttribute('role') === 'link')) s += 2;
+    } catch (e) {}
+    if (el.tagName === 'LI') s += 1;
+    if (el.tagName === 'H1' || el.tagName === 'H2' || el.tagName === 'H3') s += 1;
+    try {
+      var st = getComputedStyle(el);
+      if (st && st.cursor === 'pointer') s += 2;
+    } catch (e) {}
+    return s;
   }
   function findNextButtons() {
     var out = [];
@@ -172,18 +219,6 @@
     });
     return out;
   }
-  function clickEl(el) {
-    try {
-      el.scrollIntoView({ block: 'center' });
-      el.click();
-      return true;
-    } catch (e) {
-      try {
-        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-        return true;
-      } catch (e2) { return false; }
-    }
-  }
   function tryClickNextButton() {
     var btns = findNextButtons();
     if (!btns.length) return false;
@@ -202,15 +237,19 @@
     if (!includeHidden) arr = arr.filter(isVisible);
     return arr;
   }
+  function hrefContains(el, id) {
+    if (!id) return false;
+    try {
+      var href = el.href || el.getAttribute('data-videoid') || el.getAttribute('data-video-id') || '';
+      return href.indexOf(id) !== -1;
+    } catch (e) { return false; }
+  }
   function isLastInCatalog() {
     var id = currentVideoId();
     var links = catalogLinks(true);
     if (links.length && id) {
       var last = links[links.length - 1];
-      try {
-        var href = last.href || last.getAttribute('data-videoid') || last.getAttribute('data-video-id') || '';
-        return href.indexOf(id) !== -1;
-      } catch (e) { return false; }
+      return hrefContains(last, id);
     }
     return false;
   }
@@ -327,10 +366,7 @@
     var idx = -1;
     if (id) {
       for (var i = 0; i < links.length; i++) {
-        try {
-          var href = links[i].href || links[i].getAttribute('data-videoid') || links[i].getAttribute('data-video-id') || '';
-          if (href.indexOf(id) !== -1) { idx = i; break; }
-        } catch (e) {}
+        if (hrefContains(links[i], id)) { idx = i; break; }
       }
     }
     if (idx === -1 && title) {
@@ -414,11 +450,166 @@
     log('从课程目录点击下一课：' + (next.textContent || '').trim().slice(0, 30));
     return clickEl(link);
   }
+
+  /* ---------------- 章节识别（视频页目录） ---------------- */
+  var CN_NUM = { '零': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9 };
+  function cnToNum(s) {
+    if (CN_NUM[s] !== undefined) return CN_NUM[s];
+    if (s === '十') return 10;
+    if (s.charAt(0) === '十') return 10 + (CN_NUM[s.charAt(1)] || 0);
+    if (s.charAt(s.length - 1) === '十') return (CN_NUM[s.charAt(0)] || 0) * 10;
+    var p = s.indexOf('十');
+    if (p !== -1 && p === s.lastIndexOf('十')) {
+      var a = CN_NUM[s.slice(0, p)], b = CN_NUM[s.slice(p + 1)];
+      if (a !== undefined && b !== undefined) return a * 10 + b;
+    }
+    return null;
+  }
+  function parseChapterNo(text) {
+    try {
+      var m = String(text || '').match(/第([一二三四五六七八九十百0-9]{1,4})[章节]/);
+      if (!m) return null;
+      if (/^\d+$/.test(m[1])) return parseInt(m[1], 10);
+      return cnToNum(m[1]);
+    } catch (e) { return null; }
+  }
+  function chapterBlocks() {
+    var heads = chapterHeaders();
+    var links = catalogLinks(true);
+    if (!heads.length || !links.length) return [];
+    var ordered = heads.slice().sort(docCompare);
+    var blocks = [];
+    for (var i = 0; i < ordered.length; i++) {
+      var head = ordered[i];
+      var lks = [];
+      for (var j = 0; j < links.length; j++) {
+        try { if (head.contains(links[j])) lks.push(links[j]); } catch (e) {}
+      }
+      if (!lks.length) {
+        var nextHead = i + 1 < ordered.length ? ordered[i + 1] : null;
+        for (var k = 0; k < links.length; k++) {
+          var pos = 0;
+          try { pos = head.compareDocumentPosition(links[k]); } catch (e) {}
+          var afterHead = !!(pos & 4);
+          var beforeNext = true;
+          if (nextHead) {
+            var pos2 = 0;
+            try { pos2 = nextHead.compareDocumentPosition(links[k]); } catch (e) {}
+            beforeNext = !(pos2 & 4);
+          }
+          if (afterHead && beforeNext) lks.push(links[k]);
+        }
+      }
+      lks.sort(docCompare);
+      blocks.push({ head: head, no: parseChapterNo(head.textContent || ''), title: (head.textContent || '').trim(), links: lks });
+    }
+    return blocks;
+  }
+  function chapterState() {
+    var id = currentVideoId();
+    var blocks = chapterBlocks();
+    if (!blocks.length) return null;
+    var curIdx = -1;
+    for (var i = 0; i < blocks.length; i++) {
+      for (var j = 0; j < blocks[i].links.length; j++) {
+        if (hrefContains(blocks[i].links[j], id)) { curIdx = i; break; }
+      }
+      if (curIdx !== -1) break;
+    }
+    if (curIdx === -1) return { blocks: blocks, curIdx: -1, curBlock: null, lastInChapter: false };
+    var lastLink = blocks[curIdx].links[blocks[curIdx].links.length - 1];
+    return { blocks: blocks, curIdx: curIdx, curBlock: blocks[curIdx], lastInChapter: hrefContains(lastLink, id) };
+  }
+
+  /* ---------------- 章节切换：返回课程列表 ---------------- */
+  function scheduleChapterSwitch(curBlock) {
+    busy = true;
+    var no = curBlock && curBlock.no ? curBlock.no : 0;
+    log('【章节切换】本章已看完' + (no ? '（第' + no + '章）' : '') + '，等待进度上报后返回课程列表...');
+    var prevHref = location.href;
+    sleep(3500).then(function () {
+      sessionStorage.setItem('gxx_goto_chapter', JSON.stringify({ no: no, title: curBlock ? curBlock.title : '', t: Date.now() }));
+      sessionStorage.setItem('gxx_next_after_load', prevHref);
+      log('刷新页面并返回课程列表，按学习进度进入下一章节');
+      setTimeout(function () { location.reload(); }, 300);
+    }).catch(function (e) {
+      busy = false;
+      log('章节切换出错：' + (e && e.message ? e.message : e));
+    });
+  }
+  function goBackToCourseList() {
+    return new Promise(function (resolve) {
+      var before = location.href;
+      log('⏪ 返回课程列表页...');
+      try { history.back(); } catch (e) {}
+      sleep(4000).then(function () {
+        if (location.href !== before) {
+          if (!getAllVideos().length) { resolve(true); return; }
+          log('⚠ 返回后的页面仍是视频页，改按目录流程继续');
+          resolve(false);
+          return;
+        }
+        log('history.back 未生效，尝试点击「返回课程」链接...');
+        if (clickBackLink()) {
+          sleep(4500).then(function () {
+            resolve(location.href !== before && !getAllVideos().length);
+          });
+        } else {
+          resolve(false);
+        }
+      });
+    });
+  }
+  function clickBackLink() {
+    var TEXTS = ['返回课程列表', '返回课程', '课程列表', '课程目录', '返回列表', '返回目录', '返回'];
+    var nodes = document.querySelectorAll('a, button');
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (!isVisible(el) || isDisabled(el)) continue;
+      var t = (el.textContent || '').trim();
+      if (t.length > 12) continue;
+      for (var j = 0; j < TEXTS.length; j++) {
+        if (t === TEXTS[j] || t.indexOf(TEXTS[j]) !== -1) {
+          try {
+            if (el.href && el.href.indexOf('videoId') !== -1) continue;
+          } catch (e) {}
+          log('点击返回链接：' + t);
+          return clickEl(el);
+        }
+      }
+    }
+    return false;
+  }
+
+  /* ---------------- 下一课入口（含章节切换判定） ---------------- */
   var busy = false;
   function goNext(reason) {
     if (busy) return;
     if (!cfg.autoNext) { log('自动下一课已关闭，跳过：' + reason); return; }
+    var chs = cfg.chapterNav ? chapterState() : null;
+    // 1) 目录结构清晰：当前视频是本章最后一课
+    if (chs && chs.curIdx !== -1 && chs.lastInChapter) {
+      if (chs.blocks.length >= 2) {
+        if (chs.curIdx + 1 < chs.blocks.length) {
+          scheduleChapterSwitch(chs.blocks[chs.curIdx]);
+          return;
+        }
+        log('🎉 当前已是最后一个章节的最后一课，全部课程已看完！');
+        return;
+      }
+      // 页面上只能看到一个章节 → 后面可能还有章节，返回课程列表按进度判定
+      log('📑 本章已看完，返回课程列表按学习进度进入下一章节');
+      scheduleChapterSwitch(chs.blocks[chs.curIdx]);
+      return;
+    }
+    // 2) 整个目录已到最后
     if (isLastInCatalog()) {
+      if (cfg.chapterNav) {
+        var curB = chs && chs.curIdx !== -1 ? chs.blocks[chs.curIdx] : null;
+        log('📑 当前目录已到末尾，返回课程列表按学习进度选择下一章节');
+        scheduleChapterSwitch(curB);
+        return;
+      }
       log('🎉 当前已是课程目录的最后一课，全部课程已看完！');
       return;
     }
@@ -442,6 +633,211 @@
   document.addEventListener('ended', function (e) {
     if (e.target && e.target.tagName === 'VIDEO') goNext('视频播放结束');
   }, true);
+
+  /* ---------------- 课程列表页：按学习进度选下一章节 ---------------- */
+  function isActiveEntry(el) {
+    var n = el;
+    for (var i = 0; i < 4 && n && n !== document.documentElement; i++) {
+      try {
+        if (n.getAttribute && n.getAttribute('aria-current')) return true;
+        if (n.getAttribute && n.getAttribute('aria-selected') === 'true') return true;
+      } catch (e) {}
+      var cls = typeof n.className === 'string' ? n.className : '';
+      if (/\b(active|current|selected|checked|cur|on)\b/i.test(cls)) return true;
+      n = n.parentElement;
+    }
+    return false;
+  }
+  function readProgress(el) {
+    var node = el;
+    for (var i = 0; i < 5 && node && node !== document.documentElement; i++) {
+      try {
+        var t = (node.textContent || '');
+        if (t.length > 0 && t.length < 2000) {
+          // 若该容器里出现了两个以上章节标题，说明已经爬到整个章节列表，停止
+          if (node !== el && /第[一二三四五六七八九十百0-9]{1,4}[章节][\s\S]{0,200}第[一二三四五六七八九十百0-9]{1,4}[章节]/.test(t)) break;
+          var m1 = t.match(/(\d{1,3})\s*%/);
+          if (m1) return parseInt(m1[1], 10);
+          var m2 = t.match(/(?:已学|已看|学习|完成|进度)\D{0,6}(\d{1,3})\s*\/\s*(\d{1,3})/);
+          if (m2) return Math.round(100 * parseInt(m2[1], 10) / Math.max(1, parseInt(m2[2], 10)));
+          var pb = null;
+          try { pb = node.querySelector('[role="progressbar"]'); } catch (e) {}
+          if (pb && pb.getAttribute && pb.getAttribute('aria-valuenow')) return parseInt(pb.getAttribute('aria-valuenow'), 10);
+          var bar = null;
+          try { bar = node.querySelector('[class*="progress"][style*="width"], [class*="bar"][style*="width"]'); } catch (e) {}
+          if (bar) {
+            var mw = (bar.style && bar.style.width || '').match(/(\d{1,3})\s*%/);
+            if (mw) return parseInt(mw[1], 10);
+          }
+          if (/已学完|已完成|已看完|全部完成|已通过|学习完成/.test(t)) return 100;
+        }
+      } catch (e) {}
+      node = node.parentElement;
+    }
+    return null;
+  }
+  function findChapterEntries() {
+    var nodes = document.querySelectorAll('a,button,li,div,span,h1,h2,h3,h4,h5,h6');
+    var candidates = [];
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (!isVisible(el)) continue;
+      var t = (el.textContent || '').trim();
+      if (t.length > 120) continue;
+      var m = t.match(/第[一二三四五六七八九十百0-9]{1,4}[章节]/);
+      if (!m) continue;
+      if (t.indexOf(m[0]) > 4) continue;
+      candidates.push(el);
+    }
+    // 嵌套去重：保留可点击性更高的元素
+    var kept = [];
+    candidates.forEach(function (el) {
+      var myScore = clickableScore(el);
+      var maxIn = 0;
+      for (var k = kept.length - 1; k >= 0; k--) {
+        if (el.contains(kept[k].el)) maxIn = Math.max(maxIn, kept[k].score);
+      }
+      if (maxIn && myScore <= maxIn) return; // 外层可点击性不高于内层 → 丢弃外层
+      if (maxIn) {
+        for (var k2 = kept.length - 1; k2 >= 0; k2--) {
+          if (el.contains(kept[k2].el)) kept.splice(k2, 1);
+        }
+      }
+      kept.push({ el: el, score: myScore });
+    });
+    kept.sort(function (a, b) { return docCompare(a.el, b.el); });
+    var entries = kept.map(function (item) {
+      return {
+        el: item.el,
+        no: parseChapterNo((item.el.textContent || '').trim()),
+        text: (item.el.textContent || '').trim(),
+        progress: readProgress(item.el),
+        active: isActiveEntry(item.el)
+      };
+    });
+    // 同号去重（页头面包屑等可能也有“第X章”字样）：保留文档顺序靠后的
+    var final = [];
+    var seenNo = {};
+    entries.forEach(function (e) {
+      if (e.no === null) { final.push(e); return; }
+      var prev = seenNo[e.no];
+      if (prev !== undefined) final.splice(prev, 1);
+      seenNo[e.no] = final.length;
+      final.push(e);
+    });
+    return final;
+  }
+  function pickTargetChapter(entries, info) {
+    var startIdx = -1;
+    var no = info && info.no ? info.no : 0;
+    if (no > 0) {
+      for (var i = 0; i < entries.length; i++) {
+        if (entries[i].no === no) { startIdx = i + 1; break; }
+      }
+      if (startIdx === -1) {
+        for (var j = 0; j < entries.length; j++) {
+          if (entries[j].no === no - 1) { startIdx = j + 1; break; }
+        }
+      }
+    }
+    if (startIdx !== -1) {
+      // 从刚看完的章节之后找第一个进度未满的章节（跳过已 100% 的）
+      for (var k = startIdx; k < entries.length; k++) {
+        if (entries[k].progress === null || entries[k].progress < 100) return entries[k];
+      }
+      return null; // 后续章节全部 100% → 课程全部学完
+    }
+    // 没有章节编号：优先进度 < 100 的第一个章节
+    for (var a = 0; a < entries.length; a++) {
+      if (entries[a].progress !== null && entries[a].progress < 100) return entries[a];
+    }
+    // 其次：标记为当前章节的下一项
+    for (var b = 0; b < entries.length; b++) {
+      if (entries[b].active) return b + 1 < entries.length ? entries[b + 1] : null;
+    }
+    // 标题兜底
+    if (info && info.title) {
+      for (var c = 0; c < entries.length; c++) {
+        if ((entries[c].text || '').indexOf(info.title.slice(0, 6)) !== -1) {
+          return c + 1 < entries.length ? entries[c + 1] : null;
+        }
+      }
+    }
+    return null;
+  }
+  function findEnterButton(entryEl) {
+    var scope = entryEl;
+    for (var i = 0; i < 4 && scope && scope !== document.documentElement; i++) {
+      var btns = scope.querySelectorAll('button, a');
+      for (var j = 0; j < btns.length; j++) {
+        var t = (btns[j].textContent || '').trim();
+        if (isVisible(btns[j]) && /开始学习|进入学习|继续学习|去学习|开始观看|进入课程|立即学习/.test(t)) return btns[j];
+      }
+      scope = scope.parentElement;
+    }
+    return null;
+  }
+  function firstVideoLinkIn(entryEl) {
+    var scope = entryEl.parentElement || entryEl;
+    var as = scope.querySelectorAll('a');
+    for (var i = 0; i < as.length; i++) {
+      if (!isVisible(as[i])) continue;
+      var t = (as[i].textContent || '').trim();
+      if (t && !/^第[一二三四五六七八九十百0-9]{1,4}[章节]/.test(t.slice(0, 12))) return as[i];
+    }
+    return null;
+  }
+  var consumeBusy = false;
+  function consumeChapterFlag() {
+    if (consumeBusy) return;
+    var raw;
+    try { raw = sessionStorage.getItem('gxx_goto_chapter'); } catch (e) { return; }
+    if (!raw) return;
+    var info = null;
+    try { info = JSON.parse(raw); } catch (e) { sessionStorage.removeItem('gxx_goto_chapter'); return; }
+    if (!info || Date.now() - (info.t || 0) > 120000) { sessionStorage.removeItem('gxx_goto_chapter'); return; }
+    if (getAllVideos().length) return; // 还在视频页（如后退到了上一视频页），不动
+    consumeBusy = true;
+    var done = function (okMsg) {
+      sessionStorage.removeItem('gxx_goto_chapter');
+      if (okMsg) log(okMsg);
+      consumeBusy = false;
+    };
+    var entries = findChapterEntries();
+    if (!entries.length) {
+      var vids = catalogLinks(true);
+      if (vids.length) {
+        log('检测到视频列表页，进入第一个视频');
+        clickEl(vids[0]);
+        return done(null);
+      }
+      consumeBusy = false;
+      return; // 页面未就绪，等待下次轮询（flag 2 分钟内有效）
+    }
+    var target = pickTargetChapter(entries, info);
+    if (!target) {
+      return done('📖 未找到需要学习的章节（全部章节进度 100%，课程已学完）');
+    }
+    var t = (target.el.textContent || '').trim().slice(0, 30);
+    log('📖 进入下一章节：' + t + (target.progress !== null ? '（学习进度 ' + target.progress + '%）' : ''));
+    clickEl(target.el);
+    sleep(2500).then(function () {
+      if (getAllVideos().length) return done('✅ 已进入新章节视频，开始挂机');
+      var links = catalogLinks(true);
+      if (links.length) { log('进入章节首个视频'); clickEl(links[0]); return done(null); }
+      var l = firstVideoLinkIn(target.el);
+      if (l) { log('进入章节首个视频'); clickEl(l); return done(null); }
+      var eb = findEnterButton(target.el);
+      if (eb) { log('点击章节的「进入学习」按钮'); clickEl(eb); return done(null); }
+      var retries = (info.retries || 0) + 1;
+      if (retries >= 3) return done('⚠ 多次尝试未能进入章节，请手动点击章节标题');
+      info.retries = retries;
+      info.t = Date.now();
+      try { sessionStorage.setItem('gxx_goto_chapter', JSON.stringify(info)); } catch (e) {}
+      log('未能进入章节（第' + retries + '次），稍后重试');
+      consumeBusy = false;
+    });
+  }
 
   /* ---------------- 弹窗自动确认 ---------------- */
   function startDialogObserver() {
@@ -471,13 +867,632 @@
     }).observe(document.documentElement, { childList: true, subtree: true });
   }
 
+  /* ================= 在线测试自动答题（DeepSeek） ================= */
+  var quiz = { running: false, done: false, total: 0, answered: 0, page: 0, lastSig: '', sameSigCount: 0, stage: 'idle', lastUrl: '', manual: false };
+  var lastShot = null;
+
+  function updateQuizStatus(txt) {
+    var el = document.getElementById('gxx-quizstatus');
+    if (el) el.textContent = txt || '';
+  }
+  function quizResetIfNewPage() {
+    if (quiz.lastUrl && quiz.lastUrl !== location.href) {
+      quiz.done = false; quiz.running = false; quiz.page = 0;
+      quiz.lastSig = ''; quiz.sameSigCount = 0; quiz.stage = 'idle'; quiz.total = 0; quiz.answered = 0;
+    }
+    quiz.lastUrl = location.href;
+  }
+  function isQuizUrl() {
+    return new RegExp('/(test|exam|quiz|paper|kaoshi|shijuan|ceshi|answer)', 'i').test(location.pathname + location.search);
+  }
+  function findSubmitButton() {
+    var TEXTS = ['交卷', '提交答案', '提交试卷', '确认交卷', '交卷提交', '提交', 'submit'];
+    var nodes = document.querySelectorAll('button, a, div, span');
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (el.closest && el.closest('#gxx-panel')) continue;
+      if (!isVisible(el) || isDisabled(el)) continue;
+      var t = (el.textContent || '').trim();
+      if (!t || t.length > 12) continue;
+      var hit = false;
+      for (var j = 0; j < TEXTS.length; j++) {
+        if (t.indexOf(TEXTS[j]) === 0 || t.toLowerCase().indexOf(TEXTS[j]) === 0) { hit = true; break; }
+      }
+      if (!hit) continue;
+      if (clickableScore(el) >= 1) return el;
+    }
+    return null;
+  }
+  function findNextPageBtn() {
+    var TEXTS = ['下一题', '下一页', '下一部分', '下一大题', '继续答题', '下一步'];
+    var nodes = document.querySelectorAll('button, a, div, span');
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (!isVisible(el) || isDisabled(el)) continue;
+      var t = (el.textContent || '').trim();
+      if (!t || t.length > 10) continue;
+      for (var j = 0; j < TEXTS.length; j++) {
+        if (t.indexOf(TEXTS[j]) === 0) return el;
+      }
+    }
+    return null;
+  }
+  function radioGroups() {
+    var inputs = Array.prototype.slice.call(document.querySelectorAll('input[type=radio], input[type=checkbox]'));
+    var byName = {};
+    inputs.forEach(function (inp) {
+      var n = inp.name || '';
+      if (!n) n = '__noname__' + containerKey(inp);
+      (byName[n] = byName[n] || []).push(inp);
+    });
+    var groups = [];
+    Object.keys(byName).forEach(function (n) {
+      var g = byName[n];
+      if (!g.length) return;
+      g.sort(docCompare);
+      groups.push({ inputs: g, type: g[0].type === 'checkbox' ? 'multi' : 'single', name: n });
+    });
+    // 若几乎全部组都只有 1 个选项（比如每个选项的 name 都不同），改为按页面容器重新分组
+    var singles = 0;
+    for (var s = 0; s < groups.length; s++) { if (groups[s].inputs.length === 1) singles++; }
+    if (groups.length > 1 && singles === groups.length) {
+      var byC = {};
+      inputs.forEach(function (inp) {
+        var k = containerKey(inp);
+        (byC[k] = byC[k] || []).push(inp);
+      });
+      groups = [];
+      Object.keys(byC).forEach(function (k) {
+        var g = byC[k];
+        if (!g.length) return;
+        g.sort(docCompare);
+        groups.push({ inputs: g, type: g[0].type === 'checkbox' ? 'multi' : 'single', name: '' });
+      });
+    }
+    groups.sort(function (a, b) { return docCompare(a.inputs[0], b.inputs[0]); });
+    return groups;
+  }
+  function containerKey(inp) {
+    var node = inp;
+    for (var i = 0; i < 6 && node; i++) {
+      node = node.parentElement;
+      if (!node || node === document.documentElement) break;
+      try {
+        var ins = node.querySelectorAll('input[type=radio], input[type=checkbox]');
+        if (ins.length >= 2 && ins.length <= 8 && (node.textContent || '').length < 1500) {
+          if (!node.__gxxKey) { containerKey._id = (containerKey._id || 0) + 1; node.__gxxKey = 'c' + containerKey._id; }
+          return node.__gxxKey;
+        }
+      } catch (e) {}
+    }
+    var p = inp.parentElement || inp;
+    if (!p.__gxxKey) { containerKey._id = (containerKey._id || 0) + 1; p.__gxxKey = 'p' + containerKey._id; }
+    return p.__gxxKey;
+  }
+  function getLabelText(inp) {
+    try {
+      if (inp.labels && inp.labels.length) return (inp.labels[0].textContent || '').trim();
+      if (inp.id) {
+        var sel = inp.id.replace(/["\\]/g, '\\$&');
+        var l = document.querySelector('label[for="' + sel + '"]');
+        if (l) return (l.textContent || '').trim();
+      }
+      var p = inp.closest ? (inp.closest('label') || inp.parentElement) : inp.parentElement;
+      if (p && p !== document.documentElement && p.textContent && p.textContent.trim().length < 300) {
+        return (p.textContent || '').trim();
+      }
+      return inp.value || '';
+    } catch (e) { return inp.value || ''; }
+  }
+  function optionLetter(inp, idx) {
+    var t = getLabelText(inp);
+    var m = t.match(/^\s*([A-Ha-h])\s*[\.、．:：)）]/);
+    if (m) return m[1].toUpperCase();
+    return String.fromCharCode(65 + (idx % 26));
+  }
+  function uniqueKeys(opts) {
+    var used = {};
+    opts.forEach(function (o) {
+      if (used[o.key]) {
+        var i = 0, k = '';
+        do { k = String.fromCharCode(65 + (i++ % 26)); } while (used[k]);
+        o.key = k;
+      }
+      used[o.key] = true;
+    });
+    return opts;
+  }
+  function groupStem(inputs) {
+    try {
+      var first = inputs[0];
+      var cont = first;
+      var node = first;
+      while (node && node !== document.documentElement) {
+        var all = true;
+        for (var i = 0; i < inputs.length; i++) {
+          if (!node.contains(inputs[i])) { all = false; break; }
+        }
+        if (all) { cont = node; break; }
+        node = node.parentElement;
+      }
+      if (!cont || !cont.textContent) return '';
+      var t = (cont.textContent || '').replace(/\s+/g, ' ').trim();
+      inputs.forEach(function (inp) {
+        var lt = getLabelText(inp);
+        if (lt) t = t.split(lt).join('');
+      });
+      if (t.length > 400) t = t.slice(0, 400);
+      return t;
+    } catch (e) { return ''; }
+  }
+  function normalizeInputGroups(groups) {
+    return groups.map(function (g, i) {
+      var opts = g.inputs.map(function (inp, idx) {
+        return { key: optionLetter(inp, idx), text: getLabelText(inp).slice(0, 200), el: inp, input: true };
+      });
+      uniqueKeys(opts);
+      return { index: i + 1, type: g.type, stem: groupStem(g.inputs) || ('第' + (i + 1) + '题'), options: opts };
+    });
+  }
+  function ownText(el) {
+    try {
+      var t = '';
+      for (var i = 0; i < el.childNodes.length; i++) {
+        var n = el.childNodes[i];
+        if (n.nodeType === 3) t += n.nodeValue;
+        if (t.trim().length > 4) break;
+      }
+      return t.trim();
+    } catch (e) { return ''; }
+  }
+  function isLetterOption(el) {
+    if (!isVisible(el)) return false;
+    var t = ownText(el);
+    return /^[A-Ha-h]\s*[\.、．:：)）]\s*/.test(t) && t.length >= 3 && t.length <= 300;
+  }
+  function divGroups() {
+    var all = document.querySelectorAll('div,li,span,p,label,td');
+    var opts = [];
+    for (var i = 0; i < all.length; i++) {
+      if (isLetterOption(all[i])) opts.push(all[i]);
+    }
+    if (!opts.length) return [];
+    var groups = [];
+    opts.forEach(function (el) {
+      var container = null;
+      var node = el;
+      for (var u = 0; u < 7 && node; u++) {
+        node = node.parentElement;
+        if (!node || node === document.documentElement) break;
+        if (!node.querySelectorAll) continue;
+        var cnt = 0;
+        for (var k = 0; k < opts.length; k++) {
+          try { if (opts[k] !== el && node.contains(opts[k])) cnt++; } catch (e) {}
+        }
+        try {
+          if (cnt >= 1 && (node.textContent || '').length < 2000) { container = node; break; }
+        } catch (e) {}
+      }
+      if (!container) container = el.parentElement || el;
+      if (!container.__gxxDivKey) { divGroups._id = (divGroups._id || 0) + 1; container.__gxxDivKey = 'd' + divGroups._id; }
+      var g = null;
+      for (var gi = 0; gi < groups.length; gi++) {
+        if (groups[gi].key === container.__gxxDivKey) { g = groups[gi]; break; }
+      }
+      if (!g) { g = { key: container.__gxxDivKey, container: container, opts: [] }; groups.push(g); }
+      g.opts.push(el);
+    });
+    groups.forEach(function (g) { g.opts.sort(docCompare); });
+    groups.sort(function (a, b) { return docCompare(a.container, b.container); });
+    return groups;
+  }
+  function normalizeDivGroups(gs) {
+    return gs.map(function (g, i) {
+      var opts = g.opts.map(function (el, idx) {
+        var t = ownText(el) || '';
+        if (t.length < 3) t = (el.textContent || '').trim();
+        var m = t.match(/^([A-Ha-h])\s*[\.、．:：)）]\s*/);
+        var key = m ? m[1].toUpperCase() : String.fromCharCode(65 + (idx % 26));
+        return { key: key, text: t.slice(0, 200), el: el };
+      });
+      uniqueKeys(opts);
+      var stem = '';
+      try { stem = (g.container.textContent || '').replace(/\s+/g, ' ').trim(); } catch (e) {}
+      opts.forEach(function (o) {
+        var piece = o.text.slice(0, 20);
+        if (piece) stem = stem.split(piece).join('');
+      });
+      if (stem.length > 400) stem = stem.slice(0, 400);
+      return { index: i + 1, type: 'unknown', stem: stem || ('第' + (i + 1) + '题'), options: opts };
+    });
+  }
+  function collectAllQuestions() {
+    var ig = radioGroups();
+    if (ig.length) return normalizeInputGroups(ig);
+    return normalizeDivGroups(divGroups());
+  }
+  function detectQuiz() {
+    if (getAllVideos().length) return null;
+    var groups = radioGroups();
+    var submit = findSubmitButton();
+    var urlQuiz = isQuizUrl();
+    if (groups.length >= 1) return { kind: 'input' };
+    if (urlQuiz && submit) return { kind: 'div' };
+    return null;
+  }
+  function selectOption(el) {
+    try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+    try {
+      if (el.tagName === 'INPUT') {
+        var was = el.checked;
+        el.checked = true;
+        if (!was) el.click();
+        try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
+        try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+        return true;
+      }
+      el.click();
+      return true;
+    } catch (e) {
+      try { el.click(); return true; } catch (e2) { return false; }
+    }
+  }
+  function lettersOf(a) {
+    var ls = [];
+    if (Array.isArray(a.answer)) {
+      ls = a.answer.map(function (x) { return typeof x === 'number' ? String.fromCharCode(64 + x) : x; });
+    }
+    else if (typeof a.answer === 'string') {
+      var m = a.answer.match(/[A-Ha-h]/g);
+      if (m) ls = m;
+    } else if (typeof a.answer === 'number') ls = [String.fromCharCode(64 + a.answer)];
+    return ls.map(function (x) { return String(x).trim().toUpperCase().charAt(0); })
+      .filter(function (x) { return x >= 'A' && x <= 'H'; });
+  }
+  function applyAnswers(groups, answers) {
+    var byIdx = {};
+    answers.forEach(function (a) { if (a && a.index) byIdx[a.index] = a; });
+    var done = 0;
+    groups.forEach(function (g) {
+      var a = byIdx[g.index];
+      if (!a) return;
+      var letters = lettersOf(a);
+      if (!letters.length) return;
+      if (g.type === 'single') letters = letters.slice(0, 1);
+      var applied = 0;
+      g.options.forEach(function (o) {
+        if (letters.indexOf(o.key) !== -1 && selectOption(o.el)) applied++;
+      });
+      if (applied > 0) done++;
+    });
+    return done;
+  }
+  function callDeepSeek(system, user) {
+    var base = (cfg.apiBase || 'https://api.deepseek.com/v1').replace(/\/+$/, '');
+    var body = {
+      model: cfg.apiModel || 'deepseek-chat',
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user }
+      ],
+      temperature: 0.1,
+      stream: false
+    };
+    if (/deepseek/i.test(base)) body.response_format = { type: 'json_object' };
+    var headers = {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + cfg.apiKey
+    };
+    var transport;
+    if (typeof GM_xmlhttpRequest === 'function') {
+      transport = new Promise(function (resolve, reject) {
+        try {
+          GM_xmlhttpRequest({
+            method: 'POST',
+            url: base + '/chat/completions',
+            headers: headers,
+            data: JSON.stringify(body),
+            timeout: 180000,
+            onload: function (res) {
+              try {
+                if (res.status >= 200 && res.status < 300) resolve(JSON.parse(res.responseText));
+                else reject(new Error('HTTP ' + res.status + ' ' + String(res.responseText || '').slice(0, 200)));
+              } catch (e) { reject(e); }
+            },
+            onerror: function () { reject(new Error('GM_xmlhttpRequest 网络错误')); },
+            ontimeout: function () { reject(new Error('请求超时')); }
+          });
+        } catch (e) { reject(e); }
+      });
+    } else {
+      transport = fetch(base + '/chat/completions', {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(body)
+      }).then(function (r) {
+        if (!r.ok) {
+          return r.text().then(function (t) { throw new Error('HTTP ' + r.status + ' ' + String(t).slice(0, 200)); });
+        }
+        return r.json();
+      }).catch(function (e) {
+        if (e && /Failed to fetch|NetworkError|fetch failed|CORS|TypeError/i.test(String(e.message || e))) {
+          throw new Error('网络请求被拦截(CORS/CSP)：' + String(e.message || e) + '。可尝试按脚本头部注释切换为 GM_xmlhttpRequest 方式');
+        }
+        throw e;
+      });
+    }
+    return transport.then(function (j) {
+      var msg = j && j.choices && j.choices[0] && j.choices[0].message;
+      if (!msg || !msg.content) {
+        var err = j && j.error && j.error.message ? j.error.message : '响应格式异常';
+        throw new Error('API 返回异常：' + String(err).slice(0, 120));
+      }
+      return msg.content;
+    });
+  }
+  function parseAnswers(text) {
+    var arr = null;
+    try {
+      var obj = JSON.parse(text);
+      if (obj) {
+        if (Array.isArray(obj.answers)) arr = obj.answers;
+        else if (!obj.answers) {
+          var alt = [];
+          Object.keys(obj).forEach(function (k) {
+            if (/^\d+$/.test(k)) {
+              var v = obj[k];
+              var ls = Array.isArray(v) ? v : (typeof v === 'string' ? v.split('') : [v]);
+              alt.push({ index: parseInt(k, 10), answer: ls });
+            }
+          });
+          if (alt.length) arr = alt;
+        }
+      }
+    } catch (e) {}
+    if (!arr) {
+      var m = String(text || '').match(/\{[\s\S]*\}/);
+      if (m) {
+        try {
+          var o2 = JSON.parse(m[0]);
+          if (o2 && Array.isArray(o2.answers)) arr = o2.answers;
+        } catch (e2) {}
+      }
+    }
+    if (!arr) throw new Error('模型输出无法解析为JSON');
+    return arr.filter(function (a) { return a && a.index && a.answer; });
+  }
+  function askModel(groups) {
+    var payload = groups.map(function (g) {
+      return {
+        index: g.index,
+        type: g.type,
+        stem: g.stem,
+        options: g.options.map(function (o) { return { key: o.key, text: o.text }; })
+      };
+    });
+    var sys = '你是一名专业的考试答题助手。用户会给你一份JSON格式的题目列表，请认真分析每道题并选出正确答案。要求：\n' +
+      '1. 必须输出一个JSON对象，格式：{"answers":[{"index":1,"answer":["B"]},{"index":2,"answer":["A","C"]}]}\n' +
+      '2. 单选题 answer 数组只含一个字母；多选题可含多个字母\n' +
+      '3. 每题都要给出答案，不要遗漏；不确定的题也选择最可能的答案\n' +
+      '4. 除JSON外不要输出任何其他内容';
+    var usr = '题目列表：\n' + JSON.stringify(payload);
+    return callDeepSeek(sys, usr).then(parseAnswers);
+  }
+  function inDialog(el) {
+    var n = el;
+    for (var i = 0; i < 6 && n && n !== document.documentElement; i++) {
+      try {
+        var cls = typeof n.className === 'string' ? n.className : '';
+        if (/dialog|modal|popup|confirm|alert|mask|layer|message/i.test(cls)) return true;
+      } catch (e) {}
+      n = n.parentElement;
+    }
+    return false;
+  }
+  function watchQuizConfirm(submitBtn) {
+    var obs = new MutationObserver(function () {
+      if (quiz.stage !== 'submitting') { try { obs.disconnect(); } catch (e) {} return; }
+      var nodes = document.querySelectorAll('button, a');
+      for (var i = 0; i < nodes.length; i++) {
+        var b = nodes[i];
+        if (b === submitBtn || !isVisible(b)) continue;
+        var t = (b.textContent || '').trim();
+        if (t === '确定' || t === '确认' || t === '确认交卷' || t === '确认提交' || t === '交卷') {
+          if (t === '交卷' && !inDialog(b)) continue;
+          log('确认交卷弹窗 → 点击「' + t + '」');
+          clickEl(b);
+          quiz.stage = 'done';
+          quiz.done = true;
+          updateQuizStatus('交卷完成');
+          try { obs.disconnect(); } catch (e) {}
+          return;
+        }
+      }
+    });
+    obs.observe(document.documentElement, { childList: true, subtree: true });
+    setTimeout(function () {
+      if (quiz.stage === 'submitting') {
+        quiz.stage = 'done';
+        quiz.done = true;
+        updateQuizStatus('已交卷');
+        try { obs.disconnect(); } catch (e) {}
+      }
+    }, 8000);
+  }
+  function submitQuiz() {
+    var btn = findSubmitButton();
+    if (!btn) { log('⚠ 未找到交卷按钮，请手动交卷'); return; }
+    quiz.stage = 'submitting';
+    log('📋 所有题目作答完成，自动交卷');
+    clickEl(btn);
+    watchQuizConfirm(btn);
+  }
+  function runQuiz() {
+    if (quiz.running) return;
+    if (!cfg.apiKey) {
+      log('⚠ 未填写 DeepSeek API Key：点面板「⚙ 答题设置」填写后保存');
+      return;
+    }
+    if (getAllVideos().length) { log('当前页面有视频，非答题页'); return; }
+    var det = detectQuiz();
+    if (!det) {
+      if (isQuizUrl()) log('检测到测试页面但未发现题目元素（可能在跨域 iframe 中或尚未加载），稍后自动重试');
+      return;
+    }
+    quiz.running = true;
+    quiz.stage = 'answering';
+    var groups = collectAllQuestions();
+    if (!groups.length) {
+      log('⚠ 未识别到题目结构，请手动作答并反馈页面 HTML 结构');
+      quiz.running = false;
+      return;
+    }
+    var sig = groups.map(function (g) { return g.stem.slice(0, 40); }).join('|') + '#' + groups.length;
+    if (sig === quiz.lastSig) {
+      quiz.sameSigCount++;
+      if (quiz.sameSigCount >= 3) {
+        log('⚠ 页面内容未变化，停止自动答题，请手动检查');
+        quiz.done = true;
+        quiz.running = false;
+        return;
+      }
+    } else {
+      quiz.sameSigCount = 0;
+      quiz.lastSig = sig;
+    }
+    quiz.total += groups.length;
+    quiz.page++;
+    log('🤖 第 ' + quiz.page + ' 页：识别到 ' + groups.length + ' 道题（直接读取页面文字），正在调用 DeepSeek 作答...');
+    updateQuizStatus('答题中：已识别 ' + quiz.total + ' 题');
+    captureQuizShot();
+    askModel(groups).then(function (answers) {
+      var doneCount = applyAnswers(groups, answers);
+      quiz.answered += doneCount;
+      log('✅ 本页已作答 ' + doneCount + ' / ' + groups.length);
+      updateQuizStatus('已作答 ' + quiz.answered + ' 题');
+      var missing = groups.filter(function (g) {
+        var a = null;
+        for (var ai = 0; ai < answers.length; ai++) {
+          if (answers[ai] && answers[ai].index === g.index) { a = answers[ai]; break; }
+        }
+        if (!a) return true;
+        var ls = lettersOf(a);
+        if (!ls.length) return true;
+        var hit = false;
+        for (var oi = 0; oi < g.options.length; oi++) {
+          if (ls.indexOf(g.options[oi].key) !== -1) { hit = true; break; }
+        }
+        return !hit;
+      });
+      var proceed = function () {
+        if (!findSubmitButton()) {
+          var nx = findNextPageBtn();
+          if (nx && (cfg.autoQuiz || quiz.manual)) {
+            log('本页无交卷按钮，点击「下一题/下一页」继续作答');
+            clickEl(nx);
+            sleep(2200).then(function () { quiz.running = false; runQuiz(); });
+            return;
+          }
+        }
+        finish();
+      };
+      var finish = function () {
+        quiz.running = false;
+        quiz.stage = 'idle';
+        quiz.manual = false;
+        if (cfg.autoSubmit) {
+          quiz.done = true;
+          submitQuiz();
+        } else {
+          quiz.done = true;
+          log('已全部作答（自动交卷已关闭，可点面板「📋 交卷」手动交卷）');
+          updateQuizStatus('作答完成，待交卷');
+        }
+      };
+      if (!missing.length) { proceed(); return; }
+      log('有 ' + missing.length + ' 题未作答，重试一次...');
+      askModel(missing).then(function (ans2) {
+        applyAnswers(missing, ans2);
+        proceed();
+      }).catch(function (e) {
+        log('重试失败：' + (e && e.message ? e.message : e));
+        proceed();
+      });
+    }).catch(function (e) {
+      log('⚠ 答题出错：' + (e && e.message ? e.message : e));
+      quiz.running = false;
+      quiz.stage = 'idle';
+      quiz.manual = false;
+      updateQuizStatus('答题出错，可点「▶ 手动答题」重试');
+    });
+  }
+  function maybeAutoQuiz() {
+    quizResetIfNewPage();
+    if (!cfg.autoQuiz || !cfg.apiKey || quiz.done || quiz.running) return;
+    if (getAllVideos().length) return;
+    if (detectQuiz()) runQuiz();
+  }
+
+  /* ---------------- 可选：试卷截屏记录（不影响答题） ---------------- */
+  var h2cLoading = null;
+  function ensureHtml2canvas() {
+    if (window.html2canvas) return Promise.resolve(window.html2canvas);
+    if (h2cLoading) return h2cLoading;
+    var cdns = [
+      'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js',
+      'https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js',
+      'https://registry.npmmirror.com/html2canvas/1.4.1/files/dist/html2canvas.min.js'
+    ];
+    h2cLoading = new Promise(function (resolve, reject) {
+      var i = 0;
+      function tryNext() {
+        if (i >= cdns.length) { reject(new Error('CDN加载失败(可能被CSP拦截)')); return; }
+        var s = document.createElement('script');
+        s.src = cdns[i++];
+        s.onload = function () { resolve(window.html2canvas); };
+        s.onerror = function () { tryNext(); };
+        document.head.appendChild(s);
+        setTimeout(function () {
+          if (!window.html2canvas && s.parentNode) {
+            try { s.parentNode.removeChild(s); } catch (e) {}
+            tryNext();
+          }
+        }, 15000);
+      }
+      tryNext();
+    });
+    return h2cLoading;
+  }
+  function captureQuizShot() {
+    ensureHtml2canvas().then(function (h2c) {
+      var area = document.querySelector('[class*="paper"],[class*="exam"],[class*="test"],[class*="question"],[class*="subject"]') || document.body;
+      try {
+        h2c(area, { scale: 1, useCORS: true, logging: false, backgroundColor: '#ffffff' }).then(function (canvas) {
+          lastShot = canvas.toDataURL('image/png');
+          log('📸 试卷画面已截屏（点面板「📸 截图」可下载查看）');
+        }).catch(function (e) { log('截屏失败（不影响答题）：' + (e && e.message ? e.message : e)); });
+      } catch (e) { log('截屏失败（不影响答题）：' + (e && e.message ? e.message : e)); }
+    }).catch(function (e) { log('截图组件加载失败（不影响答题）：' + (e && e.message ? e.message : e)); });
+  }
+  function saveShot() {
+    if (!lastShot) { log('暂无截图，正在截屏...'); captureQuizShot(); return; }
+    try {
+      var a = document.createElement('a');
+      a.href = lastShot;
+      a.download = 'quiz_' + new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-') + '.png';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () { try { a.remove(); } catch (e) {} }, 100);
+    } catch (e) { log('保存截图失败：' + (e && e.message ? e.message : e)); }
+  }
+
   /* ---------------- 悬浮面板 ---------------- */
   var panel = null;
   function buildPanel() {
     if (document.getElementById('gxx-panel')) return;
     var style = document.createElement('style');
     style.textContent = [
-      '#gxx-panel{position:fixed;top:90px;right:16px;z-index:2147483000;width:252px;background:rgba(18,22,30,.96);color:#e8e8e8;border-radius:10px;font:12px/1.6 "Microsoft YaHei",sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.55);}',
+      '#gxx-panel{position:fixed;top:90px;right:16px;z-index:2147483000;width:300px;background:rgba(18,22,30,.96);color:#e8e8e8;border-radius:10px;font:12px/1.6 "Microsoft YaHei",sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.55);}',
       '#gxx-panel .gxx-head{padding:8px 10px;cursor:move;font-weight:bold;background:linear-gradient(90deg,#0a9,#087);border-radius:10px 10px 0 0;color:#fff;display:flex;justify-content:space-between;align-items:center;}',
       '#gxx-panel .gxx-body{padding:8px 10px;display:block;}',
       '#gxx-panel.gxx-min .gxx-body{display:none;}',
@@ -487,7 +1502,11 @@
       '#gxx-panel button:hover{background:#3a4558;}',
       '#gxx-panel button.gxx-on{background:#0a9;border-color:#0cb;color:#fff;}',
       '#gxx-panel .gxx-log{max-height:110px;overflow-y:auto;background:rgba(0,0,0,.35);border-radius:6px;padding:6px 8px;color:#bbb;white-space:pre-wrap;word-break:break-all;}',
-      '#gxx-panel .gxx-close,#gxx-panel .gxx-minbtn{cursor:pointer;padding:0 6px;font-size:14px;}'
+      '#gxx-panel .gxx-close,#gxx-panel .gxx-minbtn{cursor:pointer;padding:0 6px;font-size:14px;}',
+      '#gxx-panel input{width:100%;box-sizing:border-box;background:#151a24;color:#eee;border:1px solid #3a4a5a;border-radius:5px;padding:4px 6px;font-size:12px;margin-bottom:4px;}',
+      '#gxx-panel .gxx-hint{color:#8a93a3;font-size:11px;line-height:1.5;margin-bottom:4px;}',
+      '#gxx-panel .gxx-quizstatus{color:#ffd76a;min-height:16px;margin-bottom:4px;word-break:break-all;}',
+      '#gxx-panel .gxx-sep{border-top:1px dashed #3a4a5a;margin:6px 0;}'
     ].join('');
     document.head.appendChild(style);
 
@@ -514,6 +1533,33 @@
       '<button id="gxx-nextnow">⏩ 立即下一课</button>' +
       '<button id="gxx-seekend">⏭ 跳到结尾</button>' +
       '</div>' +
+      '<div class="gxx-sep"></div>' +
+      '<div class="gxx-row">' +
+      '<button id="gxx-chapnav">📑 章节切换:开</button>' +
+      '<button id="gxx-chapback">⬅ 回列表换章</button>' +
+      '</div>' +
+      '<div class="gxx-sep"></div>' +
+      '<div class="gxx-row">' +
+      '<button id="gxx-autotest">🤖 自动答题:关</button>' +
+      '<button id="gxx-quiznow">▶ 手动答题</button>' +
+      '<button id="gxx-quizsubmit">📋 交卷</button>' +
+      '</div>' +
+      '<div class="gxx-row">' +
+      '<button id="gxx-autosubmit">✅ 自动交卷:开</button>' +
+      '<button id="gxx-quizshot">📸 截图</button>' +
+      '<button id="gxx-settoggle">⚙ 答题设置</button>' +
+      '</div>' +
+      '<div class="gxx-setbody" id="gxx-setbody" style="display:none">' +
+      '<input id="gxx-apikey" type="password" placeholder="DeepSeek API Key (sk-...)" spellcheck="false">' +
+      '<input id="gxx-apibase" placeholder="API地址(默认 https://api.deepseek.com/v1)" spellcheck="false">' +
+      '<input id="gxx-apimodel" placeholder="模型(默认 deepseek-chat)" spellcheck="false">' +
+      '<div class="gxx-row">' +
+      '<button id="gxx-savekey">💾 保存</button>' +
+      '<button id="gxx-showkey">👁 显示Key</button>' +
+      '</div>' +
+      '<div class="gxx-hint">Key 仅保存在本机浏览器 localStorage。答题时直接读取页面题目文字（无需截图），调 DeepSeek 选择答案，答完自动交卷。</div>' +
+      '</div>' +
+      '<div class="gxx-quizstatus" id="gxx-quizstatus"></div>' +
       '<div class="gxx-log" id="gxx-log"></div>' +
       '</div>';
     document.body.appendChild(panel);
@@ -566,6 +1612,58 @@
       if (v && v.duration) { try { v.currentTime = v.duration - 1.5; v.play(); } catch (e) {} }
       else log('未找到视频');
     });
+    document.getElementById('gxx-chapnav').addEventListener('click', function () {
+      cfg.chapterNav = !cfg.chapterNav; save(); updatePanel();
+      log(cfg.chapterNav ? '章节切换：开（看完一章自动回课程列表按进度进下一章）' : '章节切换：关');
+    });
+    document.getElementById('gxx-chapback').addEventListener('click', function () {
+      if (busy) { log('正在跳转中，请稍候'); return; }
+      var chs = chapterState();
+      var curB = chs && chs.curIdx !== -1 ? chs.blocks[chs.curIdx] : null;
+      scheduleChapterSwitch(curB);
+    });
+    document.getElementById('gxx-autotest').addEventListener('click', function () {
+      cfg.autoQuiz = !cfg.autoQuiz; save(); updatePanel();
+      log(cfg.autoQuiz ? '自动答题：开（进入在线测试将自动作答并交卷）' : '自动答题：关');
+    });
+    document.getElementById('gxx-autosubmit').addEventListener('click', function () {
+      cfg.autoSubmit = !cfg.autoSubmit; save(); updatePanel();
+      log(cfg.autoSubmit ? '自动交卷：开' : '自动交卷：关（答完不交卷，可手动点「📋 交卷」）');
+    });
+    document.getElementById('gxx-quiznow').addEventListener('click', function () {
+      quiz.done = false;
+      quiz.manual = true;
+      runQuiz();
+    });
+    document.getElementById('gxx-quizsubmit').addEventListener('click', function () { submitQuiz(); });
+    document.getElementById('gxx-quizshot').addEventListener('click', function () { saveShot(); });
+    document.getElementById('gxx-settoggle').addEventListener('click', function () {
+      var b = document.getElementById('gxx-setbody');
+      if (b) b.style.display = b.style.display === 'none' ? 'block' : 'none';
+    });
+    document.getElementById('gxx-savekey').addEventListener('click', function () {
+      cfg.apiKey = (document.getElementById('gxx-apikey').value || '').trim();
+      cfg.apiBase = (document.getElementById('gxx-apibase').value || '').trim() || 'https://api.deepseek.com/v1';
+      cfg.apiModel = (document.getElementById('gxx-apimodel').value || '').trim() || 'deepseek-chat';
+      save(); updatePanel();
+      if (cfg.apiKey) {
+        cfg.autoQuiz = true;
+        save(); updatePanel();
+        log('✅ DeepSeek Key 已保存（仅存本机浏览器），自动答题已开启');
+      } else {
+        log('已清空 API Key');
+      }
+    });
+    document.getElementById('gxx-showkey').addEventListener('click', function () {
+      var k = document.getElementById('gxx-apikey');
+      if (k) k.type = k.type === 'password' ? 'text' : 'password';
+    });
+  }
+  function setInputVal(id, v) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    if (document.activeElement === el) return;
+    el.value = v || '';
   }
   function updatePanel() {
     if (!panel) return;
@@ -579,17 +1677,36 @@
     if (mb) mb.textContent = cfg.mute ? '🔇 静音:开' : '🔊 静音:关';
     var ab = document.getElementById('gxx-autonext');
     if (ab) ab.textContent = '🔁 自动下一课:' + (cfg.autoNext ? '开' : '关');
+    var cn = document.getElementById('gxx-chapnav');
+    if (cn) cn.textContent = '📑 章节切换:' + (cfg.chapterNav ? '开' : '关');
+    var at = document.getElementById('gxx-autotest');
+    if (at) at.textContent = '🤖 自动答题:' + (cfg.autoQuiz ? '开' : '关');
+    var as = document.getElementById('gxx-autosubmit');
+    if (as) as.textContent = '✅ 自动交卷:' + (cfg.autoSubmit ? '开' : '关');
+    setInputVal('gxx-apikey', cfg.apiKey);
+    setInputVal('gxx-apibase', cfg.apiBase);
+    setInputVal('gxx-apimodel', cfg.apiModel);
   }
   function updateStatus() {
     var el = document.getElementById('gxx-status');
     if (!el) return;
     var v = currentVideo();
-    if (!v) { el.textContent = '未发现视频元素，请打开课程视频页面'; return; }
+    if (!v) {
+      try {
+        if (sessionStorage.getItem('gxx_goto_chapter')) {
+          el.textContent = '已返回课程列表，正在按学习进度选择下一章节...';
+          return;
+        }
+      } catch (e) {}
+      el.textContent = '未发现视频元素，请打开课程视频页面';
+      return;
+    }
     var rate = v.playbackRate || 0;
     el.textContent = '视频 ' + fmt(v.currentTime) + ' / ' + fmt(v.duration) + ' · ' + rate.toFixed(1) + 'x · ' + MODE_LABEL[cfg.mode];
   }
 
   /* ---------------- 主循环 ---------------- */
+  var quizTick = 0;
   function mainLoop() {
     var vs = getAllVideos();
     for (var i = 0; i < vs.length; i++) {
@@ -605,13 +1722,41 @@
       goNext('接近结尾');
     }
     updateStatus();
+    quizTick++;
+    if (quizTick % 4 === 0) maybeAutoQuiz();
   }
 
-  /* ---------------- 刷新后自动点下一课 ---------------- */
+  /* ---------------- 刷新后自动下一课 / 返回课程列表 ---------------- */
+  function oldNextFlow(replayKey, prevHref) {
+    log('刷新完成，尝试进入下一课...');
+    var clicked = tryClickNextButton();
+    var p = clicked ? sleep(3500) : sleep(0);
+    return p.then(function () {
+      if (clicked && location.href !== prevHref) {
+        log('✅ 已通过「下一讲」按钮进入下一课');
+        sessionStorage.removeItem(replayKey);
+        return;
+      }
+      if (clicked) log('按钮未切换页面，改从课程目录点击');
+      var ok = clickNextInCatalog();
+      if (ok) {
+        return sleep(4000).then(function () {
+          if (location.href !== prevHref) {
+            log('✅ 已进入下一课');
+            sessionStorage.removeItem(replayKey);
+          } else {
+            markReplay(replayKey);
+          }
+        });
+      }
+      markReplay(replayKey);
+    });
+  }
   function onLoadAutoNext() {
     var prevHref = sessionStorage.getItem('gxx_next_after_load');
     if (!prevHref) return;
     sessionStorage.removeItem('gxx_next_after_load');
+    var chapRaw = sessionStorage.getItem('gxx_goto_chapter');
     var id = currentVideoId();
     var replayKey = 'gxx_replay_' + (id || 'none');
     setTimeout(function () {
@@ -621,29 +1766,19 @@
           sessionStorage.removeItem(replayKey);
           return;
         }
-        log('刷新完成，尝试进入下一课...');
-        var clicked = tryClickNextButton();
-        var p = clicked ? sleep(3500) : sleep(0);
-        return p.then(function () {
-          if (clicked && location.href !== prevHref) {
-            log('✅ 已通过「下一讲」按钮进入下一课');
-            sessionStorage.removeItem(replayKey);
-            return;
-          }
-          if (clicked) log('按钮未切换页面，改从课程目录点击');
-          var ok = clickNextInCatalog();
-          if (ok) {
-            return sleep(4000).then(function () {
-              if (location.href !== prevHref) {
-                log('✅ 已进入下一课');
-                sessionStorage.removeItem(replayKey);
-              } else {
-                markReplay(replayKey);
-              }
-            });
-          }
-          markReplay(replayKey);
-        });
+        if (chapRaw) {
+          return goBackToCourseList().then(function (ok) {
+            if (ok) {
+              log('✅ 已返回课程列表，正在按学习进度选择下一章节...');
+              sessionStorage.removeItem(replayKey);
+              return;
+            }
+            log('⚠ 未能返回课程列表，改用课程目录进入下一课');
+            sessionStorage.removeItem('gxx_goto_chapter');
+            return oldNextFlow(replayKey, prevHref);
+          });
+        }
+        return oldNextFlow(replayKey, prevHref);
       });
     }, 300);
   }
@@ -667,8 +1802,18 @@
     startDialogObserver();
     onLoadAutoNext();
     setInterval(mainLoop, 500);
+    setTimeout(function () { consumeChapterFlag(); }, 800);
+    setTimeout(function () { maybeAutoQuiz(); }, 1500);
+    setInterval(function () {
+      if (!getAllVideos().length) consumeChapterFlag();
+    }, 4000);
+    window.addEventListener('pageshow', function () {
+      setTimeout(function () { consumeChapterFlag(); }, 600);
+      setTimeout(function () { maybeAutoQuiz(); }, 1200);
+    });
     log('脚本已启动。当前模式：' + MODE_LABEL[cfg.mode] + (cfg.mode === 'turbo' ? ' ' + cfg.speed + 'x' : ''));
     log('本平台有服务端时长校验：默认「🐢挂机1x」最稳；加速/跳结尾仅供试验，进度可能不记录');
+    log('看完一章后会自动返回课程列表，按各章学习进度进入下一章；在线测试可接入 DeepSeek 自动答题');
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
