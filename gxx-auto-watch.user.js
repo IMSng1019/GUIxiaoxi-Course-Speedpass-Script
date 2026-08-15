@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         贵小溪学习平台 自动刷课助手
 // @namespace    gxx-autowatch
-// @version      1.2.0
-// @description  自动挂机刷完课程视频(默认1x)，看完自动刷新页面并从课程目录进入下一课
+// @version      1.3.0
+// @description  自动挂机刷完课程视频(默认1x)，看完自动刷新进入下一课，支持折叠章节自动展开/折叠
 // @author       autogen
 // @match        https://gxx-edu.digitlanguage.com/*
 // @match        http://gxx-edu.digitlanguage.com/*
@@ -196,13 +196,15 @@
   function currentTitle() {
     try { return decodeURIComponent(new URLSearchParams(location.search).get('title') || ''); } catch (e) { return ''; }
   }
-  function catalogLinks() {
+  function catalogLinks(includeHidden) {
     var nodes = document.querySelectorAll('a[href*="videoId"], [data-videoid], [data-video-id]');
-    return Array.prototype.slice.call(nodes).filter(isVisible);
+    var arr = Array.prototype.slice.call(nodes);
+    if (!includeHidden) arr = arr.filter(isVisible);
+    return arr;
   }
   function isLastInCatalog() {
     var id = currentVideoId();
-    var links = catalogLinks();
+    var links = catalogLinks(true);
     if (links.length && id) {
       var last = links[links.length - 1];
       try {
@@ -212,39 +214,186 @@
     }
     return false;
   }
+  function findHeaderIn(item) {
+    if (!item) return null;
+    var kids = Array.prototype.slice.call(item.children || []);
+    for (var k = 0; k < kids.length; k++) {
+      var el = kids[k];
+      try {
+        if (el.getAttribute && el.getAttribute('aria-expanded') !== null) return el;
+      } catch (e) {}
+      var cls = typeof el.className === 'string' ? el.className : '';
+      if (/header|title|trigger|tab/i.test(cls)) return el;
+      if (el.tagName === 'BUTTON') return el;
+    }
+    return null;
+  }
+  function expandForHiddenEntry(el) {
+    var node = el;
+    for (var i = 0; i < 12 && node && node !== document.documentElement; i++) {
+      try {
+        if (node.getAttribute && node.getAttribute('aria-expanded') === 'false') { clickEl(node); return true; }
+      } catch (e) {}
+      var cls = typeof node.className === 'string' ? node.className : '';
+      if (/collapse|accordion|chapter|section|group/i.test(cls) && !isVisible(node)) {
+        var header = findHeaderIn(node.parentElement) || findHeaderIn(node);
+        if (header) { clickEl(header); return true; }
+      }
+      node = node.parentElement;
+    }
+    return false;
+  }
+  function chapterContainerOf(el) {
+    var node = el;
+    for (var i = 0; i < 12 && node && node !== document.documentElement; i++) {
+      node = node.parentElement;
+      if (findHeaderIn(node)) return node;
+    }
+    return null;
+  }
+  function collapsePrevChapterIfNeeded(prevEl, nextEl) {
+    try {
+      var a = chapterContainerOf(prevEl);
+      var b = chapterContainerOf(nextEl);
+      if (!a || !b || a === b) return;
+      var header = findHeaderIn(a);
+      if (header && isVisible(prevEl)) clickEl(header);
+    } catch (e) {}
+  }
+  function catalogRoot() {
+    var links = catalogLinks(true);
+    if (!links.length) return null;
+    var root = links[0];
+    var guard = 0;
+    while (root && root !== document.documentElement && guard < 20) {
+      var all = true;
+      for (var i = 0; i < links.length; i++) {
+        if (!root.contains(links[i])) { all = false; break; }
+      }
+      if (all) break;
+      root = root.parentElement;
+      guard++;
+    }
+    return root;
+  }
+  function chapterHeaders() {
+    var root = catalogRoot();
+    var cand = document.querySelectorAll('[aria-expanded], [class*="chapter"], [class*="section"], [class*="group"], [class*="collapse"], [class*="accordion"]');
+    var heads = [];
+    for (var i = 0; i < cand.length; i++) {
+      var el = cand[i];
+      if (root && !root.contains(el)) continue;
+      var cls = typeof el.className === 'string' ? el.className : '';
+      var t = (el.textContent || '').trim();
+      if (t.length > 80) continue;
+      var ok = false;
+      try { if (el.getAttribute && el.getAttribute('aria-expanded') !== null) ok = true; } catch (e) {}
+      if (!ok) ok = (/chapter|section|group|collapse|accordion/i.test(cls) && /header|title|trigger|head|tab/i.test(cls));
+      if (!ok) continue;
+      var chapterLike = /chapter|section|group|category|unit/i.test(cls) ||
+        /^第[一二三四五六七八九十百0-9]{1,4}[章节篇单元部分]/.test(t) ||
+        !!(el.parentElement && el.parentElement.querySelector && el.parentElement.querySelector('a[href*="videoId"], [data-videoid], [data-video-id]'));
+      if (!chapterLike) continue;
+      if (heads.indexOf(el) === -1) heads.push(el);
+    }
+    return heads;
+  }
+  function expandNextChapter(prevEntry) {
+    var heads = chapterHeaders();
+    if (!heads.length) return false;
+    var curIdx = -1;
+    for (var i = 0; i < heads.length; i++) {
+      try {
+        if (heads[i].compareDocumentPosition(prevEntry) & Node.DOCUMENT_POSITION_FOLLOWING) curIdx = i;
+      } catch (e) {}
+    }
+    if (curIdx === -1 || curIdx + 1 >= heads.length) return false;
+    var nextHead = heads[curIdx + 1];
+    try {
+      if (nextHead.getAttribute && nextHead.getAttribute('aria-expanded') === 'true') return false;
+    } catch (e) {}
+    var container = nextHead.parentElement;
+    if (container) {
+      var lks = container.querySelectorAll('a[href*="videoId"], [data-videoid], [data-video-id]');
+      for (var j = 0; j < lks.length; j++) {
+        if (isVisible(lks[j])) return false; // 该章节已展开
+      }
+    }
+    log('展开下一章节：' + (nextHead.textContent || '').trim().slice(0, 20));
+    return clickEl(nextHead);
+  }
+  function locateInCatalog(id, title) {
+    var links = catalogLinks(true);
+    var idx = -1;
+    if (id) {
+      for (var i = 0; i < links.length; i++) {
+        try {
+          var href = links[i].href || links[i].getAttribute('data-videoid') || links[i].getAttribute('data-video-id') || '';
+          if (href.indexOf(id) !== -1) { idx = i; break; }
+        } catch (e) {}
+      }
+    }
+    if (idx === -1 && title) {
+      for (var j = 0; j < links.length; j++) {
+        if ((links[j].textContent || '').indexOf(title.slice(0, 6)) !== -1) { idx = j; break; }
+      }
+    }
+    return { links: links, idx: idx };
+  }
   function clickNextInCatalog() {
     var prevHref = location.href;
     var id = currentVideoId();
     var title = currentTitle();
-    var links = catalogLinks();
-    var idx = -1;
-    if (links.length) {
-      if (id) {
-        for (var i = 0; i < links.length; i++) {
-          try {
-            var href = links[i].href || links[i].getAttribute('data-videoid') || links[i].getAttribute('data-video-id') || '';
-            if (href.indexOf(id) !== -1) { idx = i; break; }
-          } catch (e) {}
-        }
-      }
-      if (idx === -1 && title) {
-        for (var j = 0; j < links.length; j++) {
-          if ((links[j].textContent || '').indexOf(title.slice(0, 6)) !== -1) { idx = j; break; }
-        }
-      }
-      if (idx !== -1 && idx + 1 < links.length) {
-        log('从课程目录点击下一课：' + (links[idx + 1].textContent || '').trim().slice(0, 30));
-        clickEl(links[idx + 1]);
-        sleep(4000).then(function () {
-          if (location.href === prevHref) log('⚠ 目录点击后页面未切换');
-          else log('✅ 已进入下一课');
-        });
-        return true;
-      }
+    var plan = locateInCatalog(id, title);
+    var links = plan.links, idx = plan.idx;
+    if (idx === -1) {
+      if (title && clickNextByTitle()) return true;
+      log('⚠ 未能从目录定位当前课程');
+      return false;
     }
-    if (title && clickNextByTitle()) return true;
-    log('⚠ 未能从目录定位下一课');
-    return false;
+    var step1 = sleep(0);
+    if (idx + 1 >= links.length) {
+      step1 = step1.then(function () {
+        if (!expandNextChapter(links[idx])) return null;
+        return sleep(900).then(function () {
+          var p2 = locateInCatalog(id, title);
+          return (p2.idx === -1 || p2.idx + 1 >= p2.links.length) ? null : p2;
+        });
+      });
+    } else {
+      step1 = step1.then(function () { return { links: links, idx: idx }; });
+    }
+    step1.then(function (res) {
+      var L = links, I = idx;
+      if (res) { L = res.links; I = res.idx; }
+      if (I === -1 || I + 1 >= L.length) {
+        log('⚠ 当前已是目录最后一课，或下一章节无法展开');
+        return;
+      }
+      var next = L[I + 1];
+      if (!isVisible(next)) expandForHiddenEntry(next);
+      return sleep(700).then(function () {
+        log('从课程目录点击下一课：' + (next.textContent || '').trim().slice(0, 30));
+        clickEl(next);
+        collapsePrevChapterIfNeeded(L[I], next);
+        return sleep(4000).then(function () {
+          if (location.href !== prevHref) { log('✅ 已进入下一课'); return; }
+          log('首次点击未切换，确保章节展开后重试一次');
+          expandForHiddenEntry(next);
+          return sleep(800).then(function () {
+            clickEl(next);
+            collapsePrevChapterIfNeeded(L[I], next);
+            return sleep(4000).then(function () {
+              if (location.href === prevHref) log('⚠ 目录点击后页面未切换');
+              else log('✅ 已进入下一课');
+            });
+          });
+        });
+      });
+    }).catch(function (e) {
+      log('目录点击出错：' + (e && e.message ? e.message : e));
+    });
+    return true;
   }
   function clickNextByTitle() {
     var title = currentTitle();
